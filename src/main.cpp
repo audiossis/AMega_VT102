@@ -39,11 +39,12 @@ static void markDirty(int r) {
 static uint16_t curFg = 0xFFFF;
 static uint16_t curBg = 0x0000;
 
+// ILI9481 MADCTL 0x28 has BGR=1, so colour words are BGR565 (R/B swapped).
 static const uint16_t ansiColors[16] = {
-    0x0000, 0xF800, 0x07E0, 0xFFE0,
-    0x001F, 0xF81F, 0x07FF, 0xFFFF,
-    0x8410, 0xFC00, 0x07E0, 0xFFE0,
-    0x001F, 0xF81F, 0x07FF, 0xFFFF
+    0x0000, 0x001F, 0x07E0, 0x07FF,
+    0xF800, 0xF81F, 0xFFE0, 0xFFFF,
+    0x8410, 0x041F, 0x07E0, 0x07FF,
+    0xF800, 0xF81F, 0xFFE0, 0xFFFF
 };
 
 // ---- Fast character rendering -------------------------------------------
@@ -53,15 +54,15 @@ static const uint16_t ansiColors[16] = {
 // This builds a small RGB565 pixel block and streams it with ONE
 // setAddrWindow + pushColors per chunk of 16 characters.
 #define PIXBUF_CHARS 16
-static uint16_t pixbuf[PIXBUF_CHARS * CHAR_W * CHAR_H]; // 16*6*8 = 768 px
+static uint16_t pixbuf[PIXBUF_CHARS * CHAR_W * CHAR_H + CHAR_W * CHAR_H]; // 768 + 48 px headroom
 
 static void fastDrawChars(int col, int row, const char *str, int n,
-                          uint16_t fg, uint16_t bg) {
+                          uint16_t fg, uint16_t bg, int extraBg = 0) {
     if (n <= 0) return;
     if (n > PIXBUF_CHARS) n = PIXBUF_CHARS;
     int x = col * CHAR_W;
     int y = row * CHAR_H;
-    int w = n * CHAR_W;
+    int w = n * CHAR_W + extraBg;
     tft.setAddrWindow(x, y, x + w - 1, y + CHAR_H - 1);
     uint16_t *p = pixbuf;
     // ILI9481 rotation 1 streams GRAM bottom-to-top on the vertical axis,
@@ -78,15 +79,18 @@ static void fastDrawChars(int col, int row, const char *str, int n,
                 *p++ = (line & bit) ? fg : bg;
             }
         }
+        for (int k = 0; k < extraBg; k++) *p++ = bg;
     }
-    tft.pushColors(pixbuf, n * CHAR_W * CHAR_H, true);
+    tft.pushColors(pixbuf, (n * CHAR_W + extraBg) * CHAR_H, true);
 }
 
 static void fastDrawRow(int row, const char *str, uint16_t fg, uint16_t bg) {
+    const int remainder = TERM_W - COLS * CHAR_W; // right edge not covered by whole cells
     for (int c = 0; c < COLS; c += PIXBUF_CHARS) {
         int n = COLS - c;
         if (n > PIXBUF_CHARS) n = PIXBUF_CHARS;
-        fastDrawChars(c, row, str + c, n, fg, bg);
+        int extra = (c + n == COLS) ? remainder : 0;
+        fastDrawChars(c, row, str + c, n, fg, bg, extra);
     }
 }
 
