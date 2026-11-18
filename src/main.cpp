@@ -14,6 +14,19 @@ MCUFRIEND_kbv tft;
 
 static char     screen[ROWS][COLS + 1];
 
+// Per-cell SGR flags (colours remain global — applied at redraw time).
+#define ATTR_REVERSE   0x01
+#define ATTR_UNDERLINE 0x02
+#define ATTR_BLINK     0x04
+static uint8_t cellAttr[ROWS][COLS]; // 30*66 = 1980 bytes
+static uint8_t curAttr = 0;
+static uint16_t rowFg[ROWS], rowBg[ROWS]; // colour snapshot for blink redraws (120 bytes)
+static bool blinkPhase = false;
+static bool blinkTextPresent = false;
+
+static void clearAttrRow(int r) { memset(cellAttr[r], 0, COLS); }
+static void shiftAttrUp(int dst, int src) { memcpy(cellAttr[dst], cellAttr[src], COLS); }
+
 static int cx = 0, cy = 0;
 static int cx_saved = 0, cy_saved = 0;
 
@@ -56,8 +69,9 @@ static const uint16_t ansiColors[16] = {
 #define PIXBUF_CHARS 16
 static uint16_t pixbuf[PIXBUF_CHARS * CHAR_W * CHAR_H + CHAR_W * CHAR_H]; // 768 + 48 px headroom
 
-static void fastDrawChars(int col, int row, const char *str, int n,
-                          uint16_t fg, uint16_t bg, int extraBg = 0) {
+static void fastDrawChars(int col, int row, const char *str, const uint8_t *attr,
+                          int n, uint16_t fg, uint16_t bg, int extraBg = 0,
+                          bool blinkPhase = false) {
     if (n <= 0) return;
     if (n > PIXBUF_CHARS) n = PIXBUF_CHARS;
     int x = col * CHAR_W;
@@ -66,17 +80,21 @@ static void fastDrawChars(int col, int row, const char *str, int n,
     tft.setAddrWindow(x, y, x + w - 1, y + CHAR_H - 1);
     uint16_t *p = pixbuf;
     // ILI9481 rotation 1 streams GRAM bottom-to-top on the vertical axis,
-    // but left-to-right on the horizontal axis.  Also mirror the font column
-    // order so glyphs are not backwards.
+    // but left-to-right on the horizontal axis.
     for (int py = CHAR_H - 1; py >= 0; py--) {
         uint8_t bit = 0x80 >> py;            // font bit for this glyph row
         for (int ci = 0; ci < n; ci++) {
             unsigned char c = (unsigned char)str[ci];
             if (c < 32 || c > 126) c = ' ';
+            uint8_t a = attr ? attr[ci] : 0;
+            uint16_t cellFg = fg, cellBg = bg;
+            if (a & ATTR_REVERSE) { cellFg = bg; cellBg = fg; }
+            if ((a & ATTR_BLINK) && blinkPhase) { cellFg = cellBg; }
+            bool underline = (a & ATTR_UNDERLINE) && (py == 0); // font bit 0x80 = glyph bottom row
             for (int i = 0; i < CHAR_W; i++) { // 5 font columns + 1 gap
                 uint8_t line = 0;
                 if (i < 5) line = pgm_read_byte(&term_font[c * 5 + i]);
-                *p++ = (line & bit) ? fg : bg;
+                *p++ = (underline || (line & bit)) ? cellFg : cellBg;
             }
         }
         for (int k = 0; k < extraBg; k++) *p++ = bg;
@@ -84,13 +102,15 @@ static void fastDrawChars(int col, int row, const char *str, int n,
     tft.pushColors(pixbuf, (n * CHAR_W + extraBg) * CHAR_H, true);
 }
 
-static void fastDrawRow(int row, const char *str, uint16_t fg, uint16_t bg) {
+static void fastDrawRow(int row, const char *str, const uint8_t *attr,
+                        uint16_t fg, uint16_t bg, bool blinkPhase = false) {
     const int remainder = TERM_W - COLS * CHAR_W; // right edge not covered by whole cells
     for (int c = 0; c < COLS; c += PIXBUF_CHARS) {
         int n = COLS - c;
         if (n > PIXBUF_CHARS) n = PIXBUF_CHARS;
         int extra = (c + n == COLS) ? remainder : 0;
-        fastDrawChars(c, row, str + c, n, fg, bg, extra);
+        fastDrawChars(c, row, str + c, attr ? attr + c : nullptr,
+                      n, fg, bg, extra, blinkPhase);
     }
 }
 
@@ -126,13 +146,14 @@ static int csiParam(int idx, int def) {
 }
 
 static void drawChar(int col, int row, char ch, uint16_t fg, uint16_t bg) {
-    fastDrawChars(col, row, &ch, 1, fg, bg);
+    fastDrawChars(col, row, &ch, nullptr, 1, fg, bg);
 }
 
 static void scrollUp() {
-    for (int r = 0; r < ROWS - 1; r++) memcpy(screen[r], screen[r+1], COLS+1);
+    for (int r = 0; r < ROWS - 1; r++) { memcpy(screen[r], screen[r+1], COLS+1); shiftAttrUp(r, r+1); }
     for (int c = 0; c < COLS; c++) screen[ROWS-1][c] = ' ';
     screen[ROWS-1][COLS] = '\0';
+    clearAttrRow(ROWS - 1);
     for (int r = 0; r < ROWS; r++) markDirty(r);
 }
 
@@ -143,9 +164,10 @@ static void newline() {
     if (cy > scrollBottom) {
         int n = cy - scrollBottom;
         for (int i = 0; i < n; i++) {
-            for (int r = scrollTop; r <= scrollBottom - 1; r++) memcpy(screen[r], screen[r+1], COLS+1);
+            for (int r = scrollTop; r <= scrollBottom - 1; r++) { memcpy(screen[r], screen[r+1], COLS+1); shiftAttrUp(r, r+1); }
             for (int c = 0; c < COLS; c++) screen[scrollBottom][c] = ' ';
             screen[scrollBottom][COLS] = '\0';
+            clearAttrRow(scrollBottom);
         }
         cy = scrollBottom;
         for (int r = scrollTop; r <= scrollBottom; r++) markDirty(r);
@@ -176,6 +198,9 @@ static void putChar(char ch) {
         }
     }
     screen[cy][cx] = ch;
+    cellAttr[cy][cx] = curAttr;
+    rowFg[cy] = curFg; rowBg[cy] = curBg;
+    if (curAttr & ATTR_BLINK) blinkTextPresent = true;
     markDirty(cy);
     cx++;
 }
@@ -184,13 +209,14 @@ static void handleControl(char ch) {
     switch (ch) {
         case '\r': cx = 0; newline(); justCR = true; break;
         case '\n': if (!justCR) newline(); justCR = false; cx = 0; break;
-        case '\b': if (cx > 0) { cx--; screen[cy][cx] = ' '; markDirty(cy); } break;
+        case '\b': if (cx > 0) { cx--; screen[cy][cx] = ' '; cellAttr[cy][cx] = 0; markDirty(cy); } break;
         case '\t': cx = (cx + 8) & ~7; if (cx >= COLS) cx = COLS - 1; break;
         case '\a': break;
         case '\x1B': pstate = ST_ESC; break;
         case '\x0C':
             tft.fillScreen(curBg);
-            for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; }
+            for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
+            blinkTextPresent = false;
             cx = 0; cy = 0; scrollTop = 0; scrollBottom = ROWS - 1;
             for (int r = 0; r < ROWS; r++) markDirty(r);
             break;
@@ -199,6 +225,20 @@ static void handleControl(char ch) {
             if (ch >= 0x20 && ch < 0x7F) putChar(ch);
             break;
     }
+}
+
+// xterm 256-colour palette, returned as BGR565 for the ILI9481.
+static uint16_t xterm256(int n) {
+    if (n < 16) return ansiColors[n];
+    uint8_t r, g, b;
+    if (n < 232) {
+        int v = n - 16;
+        static const uint8_t lvl[6] = {0, 95, 135, 175, 215, 255};
+        r = lvl[v / 36]; g = lvl[(v / 6) % 6]; b = lvl[v % 6];
+    } else {
+        r = g = b = 8 + 10 * (n - 232);
+    }
+    return ((uint16_t)(b >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (r >> 3);
 }
 
 static void handleCsi(char final) {
@@ -220,25 +260,28 @@ static void handleCsi(char final) {
             int mode = csiParam(0, 0);
             if (mode == 2 || mode == 3) {
                 tft.fillScreen(curBg);
-                for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; }
+                for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
+                blinkTextPresent = false;
                 cx = 0; cy = originMode ? scrollTop : 0;
                 for (int r = 0; r < ROWS; r++) markDirty(r);
             } else if (mode == 0) {
                 for (int c = cx; c < COLS; c++) screen[cy][c] = ' ';
+                memset(cellAttr[cy] + cx, 0, COLS - cx);
                 markDirty(cy);
-                for (int r = cy+1; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; markDirty(r); }
+                for (int r = cy+1; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; clearAttrRow(r); markDirty(r); }
             } else if (mode == 1) {
-                for (int r = 0; r < cy; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; markDirty(r); }
+                for (int r = 0; r < cy; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; clearAttrRow(r); markDirty(r); }
                 for (int c = 0; c <= cx; c++) screen[cy][c] = ' ';
+                memset(cellAttr[cy], 0, cx + 1);
                 markDirty(cy);
             }
             break;
         }
         case 'K': {
             int mode = csiParam(0, 0);
-            if (mode == 0) { for (int c = cx; c < COLS; c++) screen[cy][c] = ' '; markDirty(cy); }
-            else if (mode == 1) { for (int c = 0; c <= cx; c++) screen[cy][c] = ' '; markDirty(cy); }
-            else if (mode == 2) { for (int c = 0; c < COLS; c++) screen[cy][c] = ' '; markDirty(cy); cx = 0; }
+            if (mode == 0) { for (int c = cx; c < COLS; c++) screen[cy][c] = ' '; memset(cellAttr[cy]+cx, 0, COLS-cx); markDirty(cy); }
+            else if (mode == 1) { for (int c = 0; c <= cx; c++) screen[cy][c] = ' '; memset(cellAttr[cy], 0, cx+1); markDirty(cy); }
+            else if (mode == 2) { for (int c = 0; c < COLS; c++) screen[cy][c] = ' '; clearAttrRow(cy); markDirty(cy); cx = 0; }
             break;
         }
         case 'L': {
@@ -246,8 +289,8 @@ static void handleCsi(char final) {
             if (cy < scrollTop || cy > scrollBottom) break;
             int linesBelow = scrollBottom - cy + 1;
             if (n > linesBelow) n = linesBelow;
-            for (int r = scrollBottom; r >= cy + n; r--) memcpy(screen[r], screen[r-n], COLS+1);
-            for (int r = cy; r < cy + n; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; }
+            for (int r = scrollBottom; r >= cy + n; r--) { memcpy(screen[r], screen[r-n], COLS+1); shiftAttrUp(r, r-n); }
+            for (int r = cy; r < cy + n; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
             for (int r = cy; r <= scrollBottom; r++) markDirty(r);
             cx = 0; break;
         }
@@ -256,16 +299,16 @@ static void handleCsi(char final) {
             if (cy < scrollTop || cy > scrollBottom) break;
             int linesBelow = scrollBottom - cy + 1;
             if (n > linesBelow) n = linesBelow;
-            for (int r = cy; r <= scrollBottom - n; r++) memcpy(screen[r], screen[r+n], COLS+1);
-            for (int r = scrollBottom - n + 1; r <= scrollBottom; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; }
+            for (int r = cy; r <= scrollBottom - n; r++) { memcpy(screen[r], screen[r+n], COLS+1); shiftAttrUp(r, r+n); }
+            for (int r = scrollBottom - n + 1; r <= scrollBottom; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
             for (int r = cy; r <= scrollBottom; r++) markDirty(r);
             cx = 0; break;
         }
         case '@': {
             int n = csiParam(0, 1);
             if (n > COLS - cx) n = COLS - cx;
-            for (int c = COLS-1; c >= cx+n; c--) screen[cy][c] = screen[cy][c-n];
-            for (int c = cx; c < cx+n; c++) screen[cy][c] = ' ';
+            for (int c = COLS-1; c >= cx+n; c--) { screen[cy][c] = screen[cy][c-n]; cellAttr[cy][c] = cellAttr[cy][c-n]; }
+            for (int c = cx; c < cx+n; c++) { screen[cy][c] = ' '; cellAttr[cy][c] = 0; }
             screen[cy][COLS] = '\0';
             markDirty(cy);
             break;
@@ -273,8 +316,8 @@ static void handleCsi(char final) {
         case 'P': {
             int n = csiParam(0, 1);
             if (n > COLS - cx) n = COLS - cx;
-            for (int c = cx; c < COLS-n; c++) screen[cy][c] = screen[cy][c+n];
-            for (int c = COLS-n; c < COLS; c++) screen[cy][c] = ' ';
+            for (int c = cx; c < COLS-n; c++) { screen[cy][c] = screen[cy][c+n]; cellAttr[cy][c] = cellAttr[cy][c+n]; }
+            for (int c = COLS-n; c < COLS; c++) { screen[cy][c] = ' '; cellAttr[cy][c] = 0; }
             screen[cy][COLS] = '\0';
             markDirty(cy);
             break;
@@ -291,15 +334,37 @@ static void handleCsi(char final) {
             break;
         }
         case 'm': {
-            if (csiNParams == 0 || (csiNParams == 1 && csiParams[0] == 0)) { curFg = 0xFFFF; curBg = 0x0000; break; }
+            if (csiNParams == 0 || (csiNParams == 1 && csiParams[0] == 0)) {
+                curFg = 0xFFFF; curBg = 0x0000; curAttr = 0; break;
+            }
             for (uint8_t i = 0; i < csiNParams; i++) {
                 int p = csiParams[i];
-                if (p == 0) { curFg = 0xFFFF; curBg = 0x0000; }
-                else if (p == 1) { }
+                if (p == 0) { curFg = 0xFFFF; curBg = 0x0000; curAttr = 0; }
+                else if (p == 1) { }                         // bold: ignored (no bright font)
+                else if (p == 4) { curAttr |= ATTR_UNDERLINE; }
+                else if (p == 5) { curAttr |= ATTR_BLINK; }
+                else if (p == 7) { curAttr |= ATTR_REVERSE; }
+                else if (p == 21 || p == 22) { }             // normal intensity
+                else if (p == 24) { curAttr &= ~ATTR_UNDERLINE; }
+                else if (p == 25) { curAttr &= ~ATTR_BLINK; }
+                else if (p == 27) { curAttr &= ~ATTR_REVERSE; }
                 else if (p >= 30 && p <= 37) curFg = ansiColors[p-30];
                 else if (p >= 40 && p <= 47) curBg = ansiColors[p-40];
                 else if (p >= 90 && p <= 97) curFg = ansiColors[p-90+8];
                 else if (p >= 100 && p <= 107) curBg = ansiColors[p-100+8];
+                else if (p == 38 || p == 48) {
+                    // extended colour: 38;5;n (fg) or 48;5;n (bg), or 38;2;r;g;b
+                    if (i + 1 < csiNParams && csiParams[i+1] == 5 && i + 2 < csiNParams) {
+                        uint16_t col = xterm256(csiParams[i+2]);
+                        if (p == 38) curFg = col; else curBg = col;
+                        i += 2;
+                    } else if (i + 4 < csiNParams && csiParams[i+1] == 2) {
+                        uint8_t r = csiParams[i+2], g = csiParams[i+3], b = csiParams[i+4];
+                        uint16_t col = ((uint16_t)(b >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (r >> 3);
+                        if (p == 38) curFg = col; else curBg = col;
+                        i += 4;
+                    }
+                }
             }
             break;
         }
@@ -334,10 +399,11 @@ static void handleEsc(char ch) {
     else if (ch == ']') { pstate = ST_OSC; csiLen = 0; }
     else if (ch == 'c') {
         tft.fillScreen(0x0000);
-        for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; }
-        cx = 0; cy = 0; curFg = 0xFFFF; curBg = 0x0000;
+        for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
+        blinkTextPresent = false;
+        cx = 0; cy = 0; curFg = 0xFFFF; curBg = 0x0000; curAttr = 0;
         scrollTop = 0; scrollBottom = ROWS - 1;
-        originMode = false; autoWrap = true;
+        originMode = false; autoWrap = true; cursorVisible = true;
         for (int r = 0; r < ROWS; r++) markDirty(r);
         pstate = ST_NORMAL;
     }
@@ -391,6 +457,7 @@ void setup() {
     for (int r = 0; r < ROWS; r++) {
         for (int c = 0; c < COLS; c++) screen[r][c] = ' ';
         screen[r][COLS] = '\0';
+        clearAttrRow(r);
     }
 
     const char *msg = "VT102 Terminal Ready\r\nSerial3 (pins 14/15) 115200 baud\r\n";
@@ -399,7 +466,7 @@ void setup() {
     // Redraw after welcome message
     if (needsRedraw && dirtyMin <= dirtyMax) {
         for (int r = dirtyMin; r <= dirtyMax; r++) {
-            fastDrawRow(r, screen[r], curFg, curBg);
+            fastDrawRow(r, screen[r], cellAttr[r], curFg, curBg);
         }
         dirtyMin = ROWS;
         dirtyMax = -1;
@@ -426,7 +493,7 @@ void loop() {
     static unsigned long lastRedraw = 0;
     if (needsRedraw && dirtyMin <= dirtyMax && !Serial3.available() && !Serial.available() && millis() - lastRedraw > 20) {
         for (int r = dirtyMin; r <= dirtyMax; r++) {
-            fastDrawRow(r, screen[r], curFg, curBg);
+            fastDrawRow(r, screen[r], cellAttr[r], curFg, curBg);
         }
         dirtyMin = ROWS;
         dirtyMax = -1;
@@ -434,14 +501,27 @@ void loop() {
         lastRedraw = millis();
     }
 
-    // cursor blink (skip during fast data)
-    if (cursorVisible && !Serial3.available() && !Serial.available() && millis() - lastBlink > 500) {
+    // cursor + SGR blink (skip during fast data)
+    if ((cursorVisible || blinkTextPresent) && !Serial3.available() && !Serial.available() && millis() - lastBlink > 500) {
         lastBlink = millis();
+        blinkPhase = !blinkPhase;
         cursorOn = !cursorOn;
-        if (cursorOn) {
-            fastDrawChars(cx, cy, " ", 1, 0x0000, curFg);
-        } else {
-            fastDrawChars(cx, cy, &screen[cy][cx], 1, curFg, curBg);
+        if (blinkTextPresent) {
+            for (int r = 0; r < ROWS; r++) {
+                for (int c = 0; c < COLS; c++) {
+                    if (cellAttr[r][c] & ATTR_BLINK) {
+                        fastDrawChars(c, r, &screen[r][c], &cellAttr[r][c], 1,
+                                      rowFg[r], rowBg[r], 0, blinkPhase);
+                    }
+                }
+            }
+        }
+        if (cursorVisible) {
+            if (cursorOn) {
+                fastDrawChars(cx, cy, " ", nullptr, 1, 0x0000, curFg);
+            } else {
+                fastDrawChars(cx, cy, &screen[cy][cx], &cellAttr[cy][cx], 1, curFg, curBg);
+            }
         }
     }
 }
