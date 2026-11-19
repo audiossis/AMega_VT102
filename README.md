@@ -16,10 +16,41 @@ grid (6×8 px cells).
 ~/.platformio/penv/bin/pio run
 ```
 
-## Sending escape sequences
+## Escape sequence notation
 
-Escape (ESC) is byte `0x1B`, written as `\033` in `printf`. The most reliable
-way to send raw control codes from Linux:
+The commands in this document are **control bytes**, not printable text.
+Nothing shown in the tables should be typed literally; each entry describes a
+byte sequence to send. Three forms are used:
+
+| Written here | Meaning | Bytes on the wire | `printf` form |
+|--------------|---------|-------------------|---------------|
+| `ESC c` | ESC followed by one final byte | `0x1B`, `c` | `\033c` |
+| `CSI r ; c H` | CSI with numeric parameters and a final byte | `0x1B`, `[`, row, `;`, column, `H` | `\033[16;20H` (row 16, column 20) |
+| `CSI ? 25 l` | CSI with a DEC private-mode prefix | `0x1B`, `[`, `?`, `25`, `l` | `\033[?25l` |
+
+Rules for reading the command tables:
+
+- **`ESC`** is byte `0x1B`, written as `\033` in `printf`. **`CSI`** is the
+  two-byte sequence `ESC [`, written `\033[`.
+- Lower-case words such as `r`, `c`, `n`, `top`, `bot`, `w`, `h` are
+  **placeholders for decimal numbers**, not characters to transmit. Substituting
+  `r=16` and `c=20` into `CSI r ; c H` gives `CSI 16 ; 20 H`, sent as
+  `\033[16;20H`.
+- **Spaces are only for readability.** The real byte stream contains no spaces:
+  `CSI 1 ; 31 m` is sent as `\033[1;31m`.
+- The **final byte** — the letter or symbol at the end (`H`, `J`, `m`, `@`, `r`,
+  …) — is mandatory and selects the action. Parameters alone do nothing. A
+  letter can play both roles depending on position: `r` is a row number in
+  `CSI r ; c H`, but the "set scroll region" final in `CSI top ; bot r`.
+- Omitted parameters take their documented defaults, usually `1` for cursor
+  movement and `0` for erase operations. `CSI A` therefore means "move up one
+  row": `\033[A`.
+- A `?` immediately after `[` marks a **DEC private mode**, e.g. `CSI ? 25 l`
+  (hide cursor) is sent as `\033[?25l`.
+- Character-set selection uses plain `ESC`, not CSI: `ESC ( 0` is `\033(0`,
+  `ESC ( B` is `\033(B`.
+
+The most reliable way to send these bytes from Linux is `printf`:
 
 ```bash
 printf '\033[2J\033[16;20HHello' > /dev/ttyUSB1   # Serial3, 115200 baud
@@ -32,8 +63,6 @@ but many terminals have an ESC-sequence timeout that swallows following
 characters — `printf` is recommended.
 
 ## VT102 command reference
-
-**Notation:** `ESC` = `0x1B`. `CSI` = `ESC[`. `n`, `r`, `c` are decimal numbers.
 
 ### Control characters
 
