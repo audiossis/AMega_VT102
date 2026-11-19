@@ -104,6 +104,21 @@ static void gfxCircle(int x, int y, int r) {
     gfxClamp(x, y);
     tft.drawCircle(x, y, r, curFg);
 }
+static void gfxFillRect(int x, int y, int w, int h) {
+    if (w < 1 || h < 1) return;
+    int x2 = x + w - 1, y2 = y + h - 1;
+    gfxClamp(x, y); gfxClamp(x2, y2);
+    tft.fillRect(x, y, x2 - x + 1, y2 - y + 1, curFg);
+}
+static void gfxFillCircle(int x, int y, int r) {
+    if (r < 0) return;
+    gfxClamp(x, y);
+    tft.fillCircle(x, y, r, curFg);
+}
+static void gfxFillTriangle(int x1, int y1, int x2, int y2, int x3, int y3) {
+    gfxClamp(x1, y1); gfxClamp(x2, y2); gfxClamp(x3, y3);
+    tft.fillTriangle(x1, y1, x2, y2, x3, y3, curFg);
+}
 static void gfxEnter() {
     if (graphicsMode) return;
     graphicsMode = true;
@@ -343,6 +358,19 @@ static void handleCsi(char final) {
             }
             case 'C': {
                 gfxCircle(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0));
+                return;
+            }
+            case 'F': {
+                gfxFillRect(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0), csiParam(3, 0));
+                return;
+            }
+            case 'G': {
+                gfxFillCircle(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0));
+                return;
+            }
+            case 'T': {
+                gfxFillTriangle(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0),
+                                csiParam(3, 0), csiParam(4, 0), csiParam(5, 0));
                 return;
             }
             default: break;

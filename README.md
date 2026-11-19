@@ -137,10 +137,14 @@ y 0–319). `CSI ? 60 l` exits and restores the previous text screen. `ESC c`
 | `CSI x1 ; y1 ; x2 ; y2 L` | Draw a line between two points (beam unchanged) |
 | `CSI x ; y ; w ; h R` | Draw a rectangle outline at (x, y), size w×h |
 | `CSI x ; y ; r C` | Draw a circle outline centred at (x, y), radius r |
+| `CSI x ; y ; w ; h F` | Draw a filled rectangle at (x, y), size w×h |
+| `CSI x ; y ; r G` | Draw a filled circle centred at (x, y), radius r |
+| `CSI x1 ; y1 ; x2 ; y2 ; x3 ; y3 T` | Draw a filled triangle |
 | `CSI 2 J` | Clear the graphics screen (in graphics mode) |
 
 Note the different coordinate orders: `M`/`D`/`P` use **row;column** (matching
-`CSI r ; c H`), while `L`/`R`/`C` use **x;y** (matching graphics convention).
+`CSI r ; c H`), while `L`/`R`/`C`/`F`/`G`/`T` use **x;y** (matching graphics
+convention). All filled shapes use `curFg` (set via SGR) as the fill colour.
 
 Coordinates are clamped to the display. Drawing uses Adafruit_GFX primitives
 (`drawPixel`, `drawLine`, `drawRect`, `drawCircle`), which are fine for modest
@@ -287,5 +291,15 @@ printf '\033[31m\033[0;0M\033[319;399D' > /dev/ttyUSB1       # red diagonal
 printf '\033[32m\033[20;20;100;200R' > /dev/ttyUSB1          # green rectangle
 printf '\033[34m\033[160;200;60C' > /dev/ttyUSB1             # blue circle
 printf '\033[33m\033[10;20;300;380L' > /dev/ttyUSB1          # yellow line
+printf '\033[?60l' > /dev/ttyUSB1
+
+# Filled shapes
+printf '\033[?60h' > /dev/ttyUSB1
+printf '\033[31m\033[20;20;100;80F' > /dev/ttyUSB1           # red filled rect
+printf '\033[32m\033[200;160;50G' > /dev/ttyUSB1             # green filled circle
+printf '\033[34m\033[300;20;380;20;340;120T' > /dev/ttyUSB1  # blue filled triangle
+printf '\033[33m\033[60;60;80;60F' > /dev/ttyUSB1            # yellow rect (overlap test)
+printf '\033[2J' > /dev/ttyUSB1                              # clear graphics screen
+printf '\033[37m\033[0;0;399;319F' > /dev/ttyUSB1            # white full-screen fill
 printf '\033[?60l' > /dev/ttyUSB1
 ```
