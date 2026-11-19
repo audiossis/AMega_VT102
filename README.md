@@ -33,6 +33,8 @@ unrelated: **"Bytes on the wire" are hexadecimal**, while the **"`printf` form"
 uses octal escapes** (`\033` = octal 33 = decimal 27 = hex `0x1B`). Printable
 bytes such as `[`, `H` and `?` are the same in both.
 
+see: https://en.wikipedia.org/wiki/File:ASCII-Table.svg
+
 Rules for reading the command tables:
 
 - **`ESC`** is byte `0x1B` (hex), written as `\033` (octal) in `printf`.
