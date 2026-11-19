@@ -22,7 +22,7 @@ The commands in this document are **control bytes**, not printable text.
 Nothing shown in the tables should be typed literally; each entry describes a
 byte sequence to send. Three forms are used:
 
-| Written here | Meaning | Bytes on the wire (Hexidecimal notation)| `printf` form (octal notation)|
+| Written here | Meaning | Bytes on the wire (hexadecimal notation)| `printf` form (octal notation)|
 |--------------|---------|-------------------|---------------|
 | `ESC c` | ESC followed by one final byte | `0x1B`, `c` | `\033c` |
 | `CSI r ; c H` | CSI with numeric parameters and a final byte | `0x1B`, `[`, row, `;`, column, `H` | `\033[16;20H` (row 16, column 20) |
