@@ -28,10 +28,18 @@ byte sequence to send. Three forms are used:
 | `CSI r ; c H` | CSI with numeric parameters and a final byte | `0x1B`, `[`, row, `;`, column, `H` | `\033[16;20H` (row 16, column 20) |
 | `CSI ? 25 l` | CSI with a DEC private-mode prefix | `0x1B`, `[`, `?`, `25`, `l` | `\033[?25l` |
 
+The two right-hand columns use different number bases, which is why they look
+unrelated: **"Bytes on the wire" are hexadecimal**, while the **"`printf` form"
+uses octal escapes** (`\033` = octal 33 = decimal 27 = hex `0x1B`). Printable
+bytes such as `[`, `H` and `?` are the same in both.
+
 Rules for reading the command tables:
 
-- **`ESC`** is byte `0x1B`, written as `\033` in `printf`. **`CSI`** is the
-  two-byte sequence `ESC [`, written `\033[`.
+- **`ESC`** is byte `0x1B` (hex), written as `\033` (octal) in `printf`.
+  **`CSI`** is the two-byte sequence `ESC [`, written `\033[`.
+- `printf` consumes up to three octal digits after a backslash, so never put a
+  digit directly after `\033`: `\03331m` is parsed as octal `0333` (`0xDB`),
+  not ESC followed by `31m`. Keep the `[` immediately after the escape.
 - Lower-case words such as `r`, `c`, `n`, `top`, `bot`, `w`, `h` are
   **placeholders for decimal numbers**, not characters to transmit. Substituting
   `r=16` and `c=20` into `CSI r ; c H` gives `CSI 16 ; 20 H`, sent as
