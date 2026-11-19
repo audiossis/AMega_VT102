@@ -122,12 +122,27 @@ The most useful codes (type the ASCII character shown):
 `_` (`0x5F`) is blank. `o`/`p` and `r`/`s` are partial horizontal lines at
 different vertical scan positions. DEC graphics works in either width mode.
 
-### Tek-style vector graphics mode
+### Tek-style vector graphics modes
 
-`CSI ? 60 h` enters a full-screen vector graphics mode: the display is cleared,
-the text cursor is suspended, and coordinates are native pixels (x 0–399,
-y 0–319). `CSI ? 60 l` exits and restores the previous text screen. `ESC c`
-(full reset) also exits graphics mode. SGR colours apply to drawn shapes.
+Four graphics modes are available. All use native pixel coordinates
+(x 0–399, y 0–319) and SGR foreground colour. `ESC c` (full reset) exits any
+graphics mode.
+
+| Sequence | Mode | Description |
+|----------|------|-------------|
+| `CSI ? 60 h` | Full screen | Display cleared, text suspended. `CSI ? 60 l` restores the previous text screen. |
+| `CSI ? 62 h` | Combined | Text and graphics share the screen. Shapes are stored in a 24-command display list and replayed on top after every text redraw/cursor blink. `CSI ? 62 l` restores text. |
+| `CSI ? 63 h` | Split screen | Text confined to the top 20 rows (y 0–159); graphics confined to y 160–319. No overlay conflicts. `CSI ? 63 l` restores 30-row text. |
+| `CSI ? 64 h` | Static overlay | Shapes drawn directly over text once; cursor blink is disabled so they stay visible. Text written later may erase shapes in its rows. `CSI ? 64 l` restores text. |
+
+Switching directly between graphics modes clears the existing shapes. Exiting
+any mode redraws the text buffer (which is left untouched while graphics are
+active).
+
+**Combined mode details:** coordinates are recorded per shape along with the
+colour active at draw time, so later SGR changes do not recolour old shapes.
+The list holds 24 shapes; further commands replace the oldest. `CSI 2 J`
+clears both text and the shape list.
 
 | Sequence | Action |
 |----------|--------|
@@ -140,15 +155,17 @@ y 0–319). `CSI ? 60 l` exits and restores the previous text screen. `ESC c`
 | `CSI x ; y ; w ; h F` | Draw a filled rectangle at (x, y), size w×h |
 | `CSI x ; y ; r G` | Draw a filled circle centred at (x, y), radius r |
 | `CSI x1 ; y1 ; x2 ; y2 ; x3 ; y3 T` | Draw a filled triangle |
-| `CSI 2 J` | Clear the graphics screen (in graphics mode) |
+| `CSI 2 J` | Clear the graphics screen (in graphics modes 60/62/63/64) |
 
 Note the different coordinate orders: `M`/`D`/`P` use **row;column** (matching
 `CSI r ; c H`), while `L`/`R`/`C`/`F`/`G`/`T` use **x;y** (matching graphics
 convention). All filled shapes use `curFg` (set via SGR) as the fill colour.
 
-Coordinates are clamped to the display. Drawing uses Adafruit_GFX primitives
-(`drawPixel`, `drawLine`, `drawRect`, `drawCircle`), which are fine for modest
-shapes but not high-speed animation. `CSI 31 m` etc. set the drawing colour.
+Coordinates are clamped to the display; in split mode the lower bound is y=160,
+and circle radii are reduced to keep circles inside the graphics band. Drawing
+uses Adafruit_GFX primitives (`drawPixel`, `drawLine`, `drawRect`, `drawCircle`),
+which are fine for modest shapes but not high-speed animation. `CSI 31 m` etc.
+set the drawing colour.
 
 ### Select Graphic Rendition (SGR) — `CSI ... m`
 
@@ -302,4 +319,104 @@ printf '\033[33m\033[60;60;80;60F' > /dev/ttyUSB1            # yellow rect (over
 printf '\033[2J' > /dev/ttyUSB1                              # clear graphics screen
 printf '\033[37m\033[0;0;399;319F' > /dev/ttyUSB1            # white full-screen fill
 printf '\033[?60l' > /dev/ttyUSB1
+
+# Combined: text with a chart drawn on top; typing more text keeps the shape
+printf '\033[2J\033[?62h\033[3;1HSales report' > /dev/ttyUSB1
+printf '\033[32m\033[20;240;60;40F' > /dev/ttyUSB1           # green bar
+printf '\033[31m\033[100;240;60;80F' > /dev/ttyUSB1          # red bar
+printf '\033[5;1HTyped while graphics active' > /dev/ttyUSB1
+printf '\033[?62l' > /dev/ttyUSB1
+
+# Split screen: 20 text rows above, graphics below y=160
+printf '\033[2J\033[?63h\033[2;1HTop text area' > /dev/ttyUSB1
+printf '\033[34m\033[0;160;399;319R' > /dev/ttyUSB1          # frame bottom area
+printf '\033[33m\033[20;180;60;200L' > /dev/ttyUSB1          # line in bottom area
+printf '\033[?63l' > /dev/ttyUSB1
+
+# Static overlay: graphics over existing text, blink disabled
+printf '\033[?64h\033[36m\033[50;50;200;100R' > /dev/ttyUSB1
+printf '\033[?64l' > /dev/ttyUSB1
 ```
+
+## Manual verification: text + graphics modes
+
+The sequences below were used to verify each mode on hardware (Serial3 at
+115200, `/dev/ttyUSB1`). Use `printf` rather than typing literal `\033`.
+
+### Combined mode (`CSI ? 62 h`)
+
+```bash
+printf '\033[2J\033[?62h' > /dev/ttyUSB1
+printf '\033[1;1HCOMBINED MODE TEST' > /dev/ttyUSB1
+printf '\033[31m\033[20;24;200;48R' > /dev/ttyUSB1
+printf '\033[4;1HText typed over the rectangle' > /dev/ttyUSB1
+```
+
+Expected: a red rectangle spanning rows 3–6. The last command redraws row 4
+with text, but the rectangle edge in that row remains because the shape is
+replayed on top. Waiting ~2 s confirms cursor blink does not break it either.
+
+```bash
+printf '\033[?62l' > /dev/ttyUSB1
+```
+
+Expected: the rectangle disappears, text stays. Colour snapshot test:
+
+```bash
+printf '\033[?62h\033[31m\033[20;24;80;48F\033[34m\033[120;24;80;48F' > /dev/ttyUSB1
+printf '\033[4;1HRedraw trigger' > /dev/ttyUSB1
+```
+
+Expected: the first bar stays red after the second (blue) is drawn and a text
+redraw is forced.
+
+### Split mode (`CSI ? 63 h`)
+
+```bash
+printf '\033[2J\033[?63h\033[1;1HSPLIT: top 20 rows text' > /dev/ttyUSB1
+printf '\033[32m\033[0;160;399;319R' > /dev/ttyUSB1
+printf '\033[33m\033[20;180;380;300L' > /dev/ttyUSB1
+printf '\033[34m\033[100;240;30G' > /dev/ttyUSB1
+```
+
+Expected: text at the top, frame + diagonal + blue circle in the bottom 160 px.
+Then scroll text hard:
+
+```bash
+printf '\033[1;1H' > /dev/ttyUSB1
+for i in $(seq 1 35); do printf 'line %02d\r\n' "$i" > /dev/ttyUSB1; sleep 0.05; done
+```
+
+Expected: text stops scrolling at row 20, graphics band untouched.
+
+```bash
+printf '\033[?63l' > /dev/ttyUSB1
+```
+
+Expected: 30-row text layout restored, including previously hidden rows 20–29.
+
+### Static overlay (`CSI ? 64 h`)
+
+```bash
+printf '\033[2J\033[1;1HSTATIC OVERLAY TEST' > /dev/ttyUSB1
+printf '\033[?64h\033[36m\033[50;40;200;120R' > /dev/ttyUSB1
+```
+
+Expected: cyan rectangle over text, with no cursor blink cutting into it after
+~2 s.
+
+```bash
+printf '\033[3;1HText may erase shape here' > /dev/ttyUSB1
+printf '\033[?64l' > /dev/ttyUSB1
+```
+
+Expected: row 3 breaks the rectangle (documented limitation of static mode),
+then exiting restores clean text.
+
+### Reset from a graphics mode
+
+```bash
+printf '\033[?62h\033[31m\033[20;20;100;100F\033c' > /dev/ttyUSB1
+```
+
+Expected: full reset clears everything and returns to normal 30-row text.

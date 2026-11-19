@@ -54,6 +54,11 @@ static void markDirty(int r) {
 static uint16_t curFg = 0xFFFF;
 static uint16_t curBg = 0x0000;
 
+// CSI parsing state is declared here because graphics commands consume it.
+static int csiParams[8];
+static uint8_t csiNParams = 0;
+static int csiParam(int idx, int def);
+
 // DEC graphics (ESC ( 0 / ESC ( B) is baked into each cell at write time so
 // previously drawn boxes stay boxes when the charset is switched back.
 static bool decGraphics = false;
@@ -78,57 +83,175 @@ static void setDoubleWidth(bool on) {
     for (int r = 0; r < ROWS; r++) markDirty(r);
 }
 
-// ---- Tek-style vector graphics mode --------------------------------------
-// A dedicated full-screen graphics mode.  The text buffers stay untouched in
-// RAM, so exiting simply redraws them.  Coordinates are native pixels.
-static bool graphicsMode = false;
+// ---- Vector graphics modes ------------------------------------------------
+// GFX_FULL     full-screen graphics, text suspended       (CSI ?60h)
+// GFX_COMBINED text + graphics, replayed after redraws    (CSI ?62h)
+// GFX_SPLIT    text in top 20 rows, graphics in bottom    (CSI ?63h)
+// GFX_STATIC   graphics drawn once over text, no replay   (CSI ?64h)
+//
+// The text buffers are never touched while any graphics mode is active, so
+// leaving a mode simply redraws them.  Coordinates are native pixel values.
+enum GfxMode { GFX_OFF = 0, GFX_FULL, GFX_COMBINED, GFX_SPLIT, GFX_STATIC };
+static GfxMode gfxMode = GFX_OFF;
 static int beamX = 0, beamY = 0;
+
+static bool gfxActive()    { return gfxMode != GFX_OFF; }
+static int  textRows()     { return (gfxMode == GFX_SPLIT) ? 20 : ROWS; }
+static int  gfxYMin()      { return (gfxMode == GFX_SPLIT) ? 20 * CHAR_H : 0; }
+static bool blinkAllowed() { return gfxMode == GFX_OFF || gfxMode == GFX_COMBINED || gfxMode == GFX_SPLIT; }
 
 static void gfxClamp(int &x, int &y) {
     if (x < 0) x = 0; else if (x >= TERM_W) x = TERM_W - 1;
-    if (y < 0) y = 0; else if (y >= TERM_H) y = TERM_H - 1;
+    int ymin = gfxYMin();
+    if (y < ymin) y = ymin; else if (y >= TERM_H) y = TERM_H - 1;
 }
-static void gfxPoint(int x, int y) { gfxClamp(x, y); tft.drawPixel(x, y, curFg); }
-static void gfxLine(int x1, int y1, int x2, int y2) {
+
+// Primitives take an explicit colour so the display list can replay a shape
+// with the colour that was active when it was originally drawn.
+static void gfxPoint(int x, int y, uint16_t color) {
+    gfxClamp(x, y); tft.drawPixel(x, y, color);
+}
+static void gfxLine(int x1, int y1, int x2, int y2, uint16_t color) {
     gfxClamp(x1, y1); gfxClamp(x2, y2);
-    tft.drawLine(x1, y1, x2, y2, curFg);
+    tft.drawLine(x1, y1, x2, y2, color);
 }
-static void gfxRect(int x, int y, int w, int h) {
+static void gfxRect(int x, int y, int w, int h, uint16_t color) {
     if (w < 1 || h < 1) return;
     int x2 = x + w - 1, y2 = y + h - 1;
     gfxClamp(x, y); gfxClamp(x2, y2);
-    tft.drawRect(x, y, x2 - x + 1, y2 - y + 1, curFg);
+    tft.drawRect(x, y, x2 - x + 1, y2 - y + 1, color);
 }
-static void gfxCircle(int x, int y, int r) {
+static void gfxCircle(int x, int y, int r, uint16_t color) {
     if (r < 0) return;
     gfxClamp(x, y);
-    tft.drawCircle(x, y, r, curFg);
+    if (gfxMode == GFX_SPLIT) {           // keep circles inside the graphics band
+        int maxr = min(y - gfxYMin(), TERM_H - 1 - y);
+        if (r > maxr) r = maxr;
+    }
+    tft.drawCircle(x, y, r, color);
 }
-static void gfxFillRect(int x, int y, int w, int h) {
+static void gfxFillRect(int x, int y, int w, int h, uint16_t color) {
     if (w < 1 || h < 1) return;
     int x2 = x + w - 1, y2 = y + h - 1;
     gfxClamp(x, y); gfxClamp(x2, y2);
-    tft.fillRect(x, y, x2 - x + 1, y2 - y + 1, curFg);
+    tft.fillRect(x, y, x2 - x + 1, y2 - y + 1, color);
 }
-static void gfxFillCircle(int x, int y, int r) {
+static void gfxFillCircle(int x, int y, int r, uint16_t color) {
     if (r < 0) return;
     gfxClamp(x, y);
-    tft.fillCircle(x, y, r, curFg);
+    if (gfxMode == GFX_SPLIT) {
+        int maxr = min(y - gfxYMin(), TERM_H - 1 - y);
+        if (r > maxr) r = maxr;
+    }
+    tft.fillCircle(x, y, r, color);
 }
-static void gfxFillTriangle(int x1, int y1, int x2, int y2, int x3, int y3) {
+static void gfxFillTriangle(int x1, int y1, int x2, int y2, int x3, int y3, uint16_t color) {
     gfxClamp(x1, y1); gfxClamp(x2, y2); gfxClamp(x3, y3);
-    tft.fillTriangle(x1, y1, x2, y2, x3, y3, curFg);
+    tft.fillTriangle(x1, y1, x2, y2, x3, y3, color);
 }
-static void gfxEnter() {
-    if (graphicsMode) return;
-    graphicsMode = true;
+
+// --- Display list for GFX_COMBINED -----------------------------------------
+// Text redraws write whole rows with the background colour, wiping any
+// graphics underneath.  Storing each drawing command (type, six coordinates
+// and its colour) lets us replay them on top after every redraw / blink.
+#define GFX_LIST_MAX 24
+struct GfxCmd {
+    uint8_t type, pad;
+    int16_t p[6];
+    uint16_t color;
+};
+static GfxCmd gfxList[GFX_LIST_MAX];   // 24 * 16 = 384 bytes
+static uint8_t gfxListLen = 0;
+static bool gfxNeedsReplay = false;
+
+static void gfxStore(uint8_t type, const int *p, uint16_t color) {
+    if (gfxListLen >= GFX_LIST_MAX) {   // drop the oldest shape
+        memmove(gfxList, gfxList + 1, sizeof(GfxCmd) * (GFX_LIST_MAX - 1));
+        gfxListLen = GFX_LIST_MAX - 1;
+    }
+    GfxCmd &c = gfxList[gfxListLen++];
+    c.type = type;
+    for (int i = 0; i < 6; i++) c.p[i] = (int16_t)p[i];
+    c.color = color;
+}
+
+static void gfxReplay() {
+    for (uint8_t i = 0; i < gfxListLen; i++) {
+        const GfxCmd &c = gfxList[i];
+        switch (c.type) {
+            case 'P': gfxPoint(c.p[0], c.p[1], c.color); break;
+            case 'L': gfxLine(c.p[0], c.p[1], c.p[2], c.p[3], c.color); break;
+            case 'R': gfxRect(c.p[0], c.p[1], c.p[2], c.p[3], c.color); break;
+            case 'C': gfxCircle(c.p[0], c.p[1], c.p[2], c.color); break;
+            case 'F': gfxFillRect(c.p[0], c.p[1], c.p[2], c.p[3], c.color); break;
+            case 'G': gfxFillCircle(c.p[0], c.p[1], c.p[2], c.color); break;
+            case 'T': gfxFillTriangle(c.p[0], c.p[1], c.p[2], c.p[3], c.p[4], c.p[5], c.color); break;
+        }
+    }
+}
+
+// Unified drawing dispatch: draws immediately, and records shapes for replay
+// when in GFX_COMBINED mode.  'M' only moves the beam and is never stored.
+static void gfxCommand(char final) {
+    uint16_t col = curFg;
+    bool store = (gfxMode == GFX_COMBINED);
+    int p[6] = {0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < csiNParams && i < 6; i++) p[i] = csiParams[i];
+
+    switch (final) {
+        case 'M': beamY = csiParam(0, 0); beamX = csiParam(1, 0); return;
+        case 'D': {
+            int x = csiParam(1, 0), y = csiParam(0, 0);
+            gfxLine(beamX, beamY, x, y, col);
+            if (store) { int q[6] = {beamX, beamY, x, y, 0, 0}; gfxStore('L', q, col); }
+            beamX = x; beamY = y;
+            return;
+        }
+        case 'P': {
+            int x = csiParam(1, 0), y = csiParam(0, 0);
+            gfxPoint(x, y, col);
+            if (store) { int q[6] = {x, y, 0, 0, 0, 0}; gfxStore('P', q, col); }
+            return;
+        }
+        case 'L': gfxLine(p[0], p[1], p[2], p[3], col); if (store) gfxStore('L', p, col); return;
+        case 'R': gfxRect(p[0], p[1], p[2], p[3], col); if (store) gfxStore('R', p, col); return;
+        case 'C': gfxCircle(p[0], p[1], p[2], col);     if (store) gfxStore('C', p, col); return;
+        case 'F': gfxFillRect(p[0], p[1], p[2], p[3], col); if (store) gfxStore('F', p, col); return;
+        case 'G': gfxFillCircle(p[0], p[1], p[2], col); if (store) gfxStore('G', p, col); return;
+        case 'T': gfxFillTriangle(p[0], p[1], p[2], p[3], p[4], p[5], col);
+                  if (store) gfxStore('T', p, col); return;
+    }
+}
+
+static void gfxSetMode(GfxMode m) {
+    if (gfxMode == m) return;
+    GfxMode old = gfxMode;
+
+    if (old == GFX_SPLIT) { scrollTop = 0; scrollBottom = ROWS - 1; }
+    if (old != GFX_OFF) {
+        gfxListLen = 0;
+        gfxNeedsReplay = false;
+        for (int r = 0; r < ROWS; r++) markDirty(r);  // redraw text over old graphics
+    }
+
+    gfxMode = m;
     beamX = 0; beamY = 0;
-    tft.fillScreen(curBg);
-}
-static void gfxExit() {
-    if (!graphicsMode) return;
-    graphicsMode = false;
-    for (int r = 0; r < ROWS; r++) markDirty(r);
+
+    switch (m) {
+        case GFX_OFF: break;
+        case GFX_FULL:
+            tft.fillScreen(curBg);
+            break;
+        case GFX_COMBINED:
+            gfxListLen = 0;              // keep the existing text on screen
+            break;
+        case GFX_SPLIT:
+            scrollTop = 0; scrollBottom = textRows() - 1;
+            if (cy >= textRows()) cy = textRows() - 1;
+            tft.fillRect(0, gfxYMin(), TERM_W, TERM_H - gfxYMin(), curBg);
+            break;
+        case GFX_STATIC: break;          // keep text, no list, blink disabled
+    }
 }
 
 // ILI9481 MADCTL 0x28 has BGR=1, so colour words are BGR565 (R/B swapped).
@@ -210,9 +333,6 @@ static bool charsetG1 = false;   // ESC ( = G0, ESC ) = G1 (G1 designations igno
 static char csiBuf[32];
 static uint8_t csiLen = 0;
 
-static int csiParams[8];
-static uint8_t csiNParams = 0;
-
 static void parseCsiParams() {
     csiNParams = 0;
     char *p = csiBuf;
@@ -263,7 +383,7 @@ static void newline() {
         cy = scrollBottom;
         for (int r = scrollTop; r <= scrollBottom; r++) markDirty(r);
     }
-    if (cy >= ROWS) cy = ROWS - 1;
+    if (cy >= textRows()) cy = textRows() - 1;
     markDirty(cy);
 }
 
@@ -283,7 +403,7 @@ static void putChar(char ch) {
                 cy = scrollBottom;
                 for (int r = scrollTop; r <= scrollBottom; r++) markDirty(r);
             }
-            if (cy >= ROWS) cy = ROWS - 1;
+            if (cy >= textRows()) cy = textRows() - 1;
             markDirty(cy);
         } else {
             cx = cols - 1;
@@ -309,7 +429,7 @@ static void handleControl(char ch) {
             tft.fillScreen(curBg);
             for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
             blinkTextPresent = false;
-            cx = 0; cy = 0; scrollTop = 0; scrollBottom = ROWS - 1;
+            cx = 0; cy = 0; scrollTop = 0; scrollBottom = textRows() - 1;
             for (int r = 0; r < ROWS; r++) markDirty(r);
             break;
         default:
@@ -338,39 +458,31 @@ static void handleCsi(char final) {
     parseCsiParams();
 
     // Graphics-mode primitives.  M/D/P use row;col like cursor addressing;
-    // L/R/C use x;y like graphics coordinates.  Other finals (m, h, l, ...)
-    // fall through to normal handling so SGR colours and mode toggles work.
-    if (graphicsMode) {
+    // L/R/C/F/G/T use x;y like graphics coordinates.  Other finals (m, h, l,
+    // ...) fall through so SGR colours and mode toggles work in every mode.
+    if (gfxActive()) {
         switch (final) {
-            case 'M': { beamY = csiParam(0, 0); beamX = csiParam(1, 0); return; }
-            case 'D': {
-                int y = csiParam(0, 0), x = csiParam(1, 0);
-                gfxLine(beamX, beamY, x, y); beamX = x; beamY = y; return;
-            }
-            case 'P': { gfxPoint(csiParam(1, 0), csiParam(0, 0)); return; }
-            case 'L': {
-                gfxLine(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0), csiParam(3, 0));
+            case 'M': case 'D': case 'P': case 'L': case 'R': case 'C':
+            case 'F': case 'G': case 'T':
+                gfxCommand(final);
                 return;
-            }
-            case 'R': {
-                gfxRect(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0), csiParam(3, 0));
-                return;
-            }
-            case 'C': {
-                gfxCircle(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0));
-                return;
-            }
-            case 'F': {
-                gfxFillRect(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0), csiParam(3, 0));
-                return;
-            }
-            case 'G': {
-                gfxFillCircle(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0));
-                return;
-            }
-            case 'T': {
-                gfxFillTriangle(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0),
-                                csiParam(3, 0), csiParam(4, 0), csiParam(5, 0));
+            case 'J': {
+                int mode = csiParam(0, 0);
+                if (mode == 2 || mode == 3) {
+                    tft.fillScreen(curBg);
+                    gfxListLen = 0;
+                    beamX = 0; beamY = 0;
+                    if (gfxMode != GFX_FULL) {
+                        for (int r = 0; r < ROWS; r++) {
+                            for (int c = 0; c < COLS; c++) screen[r][c] = ' ';
+                            screen[r][COLS] = '\0';
+                            clearAttrRow(r);
+                        }
+                        blinkTextPresent = false;
+                        cx = 0; cy = 0;
+                        for (int r = 0; r < ROWS; r++) markDirty(r);
+                    }
+                }
                 return;
             }
             default: break;
@@ -381,7 +493,7 @@ static void handleCsi(char final) {
         case 'H': case 'f': {
             int r = csiParam(0, 1) - 1; int c = csiParam(1, 1) - 1;
             if (originMode) { r += scrollTop; if (r > scrollBottom) r = scrollBottom; }
-            if (r < 0) r = 0; if (r >= ROWS) r = ROWS - 1;
+            if (r < 0) r = 0; if (r >= textRows()) r = textRows() - 1;
             if (c < 0) c = 0; if (c >= effCols()) c = effCols() - 1;
             cx = c; cy = r; markDirty(cy); break;
         }
@@ -391,10 +503,6 @@ static void handleCsi(char final) {
         case 'D': { int n = csiParam(0,1); cx -= n; if (cx < 0) cx = 0; break; }
         case 'J': {
             int mode = csiParam(0, 0);
-            if (graphicsMode) {
-                if (mode == 2 || mode == 3) { tft.fillScreen(curBg); beamX = 0; beamY = 0; }
-                break;
-            }
             if (mode == 2 || mode == 3) {
                 tft.fillScreen(curBg);
                 for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
@@ -463,10 +571,10 @@ static void handleCsi(char final) {
         }
         case 'r': {
             int top = csiParam(0, 1) - 1;
-            int bot = csiParam(1, ROWS) - 1;
+            int bot = csiParam(1, textRows()) - 1;
             if (top < 0) top = 0;
-            if (bot >= ROWS) bot = ROWS - 1;
-            if (top > bot) { top = 0; bot = ROWS - 1; }
+            if (bot >= textRows()) bot = textRows() - 1;
+            if (top > bot) { top = 0; bot = textRows() - 1; }
             scrollTop = top; scrollBottom = bot;
             cx = 0; cy = originMode ? scrollTop : 0;
             markDirty(cy);
@@ -517,7 +625,10 @@ static void handleCsi(char final) {
                     if (csiParams[i] == 25) cursorVisible = true;
                     if (csiParams[i] == 50) setDoubleWidth(false); // normal width
                     if (csiParams[i] == 51) setDoubleWidth(true);  // double width
-                    if (csiParams[i] == 60) gfxEnter();              // vector graphics mode
+                    if (csiParams[i] == 60) gfxSetMode(GFX_FULL);     // full-screen graphics
+                    if (csiParams[i] == 62) gfxSetMode(GFX_COMBINED); // text + graphics overlay
+                    if (csiParams[i] == 63) gfxSetMode(GFX_SPLIT);    // split screen
+                    if (csiParams[i] == 64) gfxSetMode(GFX_STATIC);   // static graphics overlay
                 }
             }
             break;
@@ -529,7 +640,8 @@ static void handleCsi(char final) {
                     if (csiParams[i] == 7) autoWrap = false;
                     if (csiParams[i] == 25) cursorVisible = false;
                     if (csiParams[i] == 50 || csiParams[i] == 51) setDoubleWidth(false);
-                    if (csiParams[i] == 60) gfxExit();               // back to text mode
+                    if (csiParams[i] == 60 || csiParams[i] == 62 ||
+                        csiParams[i] == 63 || csiParams[i] == 64) gfxSetMode(GFX_OFF);
                 }
             }
             break;
@@ -549,7 +661,8 @@ static void handleEsc(char ch) {
         cx = 0; cy = 0; curFg = 0xFFFF; curBg = 0x0000; curAttr = 0;
         scrollTop = 0; scrollBottom = ROWS - 1;
         originMode = false; autoWrap = true; cursorVisible = true;
-        decGraphics = false; doubleWidth = false; graphicsMode = false;
+        decGraphics = false; doubleWidth = false;
+        gfxMode = GFX_OFF; gfxListLen = 0; gfxNeedsReplay = false;
         for (int r = 0; r < ROWS; r++) markDirty(r);
         pstate = ST_NORMAL;
     }
@@ -658,24 +771,28 @@ void loop() {
 
     // Redraw dirty rows (debounced: only when no data pending and 20ms since last redraw)
     static unsigned long lastRedraw = 0;
-    if (!graphicsMode && needsRedraw && dirtyMin <= dirtyMax && !Serial3.available() && !Serial.available() && millis() - lastRedraw > 20) {
+    if (gfxMode != GFX_FULL && needsRedraw && dirtyMin <= dirtyMax &&
+        !Serial3.available() && !Serial.available() && millis() - lastRedraw > 20) {
         for (int r = dirtyMin; r <= dirtyMax; r++) {
+            if (gfxMode == GFX_SPLIT && r >= textRows()) continue;
             fastDrawRow(r, screen[r], cellAttr[r], curFg, curBg);
         }
         dirtyMin = ROWS;
         dirtyMax = -1;
         needsRedraw = false;
         lastRedraw = millis();
+        if (gfxMode == GFX_COMBINED) gfxNeedsReplay = true;
     }
 
-    // cursor + SGR blink (skip during fast data)
-    if (!graphicsMode && (cursorVisible || blinkTextPresent) && !Serial3.available() && !Serial.available() && millis() - lastBlink > 500) {
+    // cursor + SGR blink (skip during fast data; static overlay keeps graphics intact)
+    if (blinkAllowed() && (cursorVisible || blinkTextPresent) &&
+        !Serial3.available() && !Serial.available() && millis() - lastBlink > 500) {
         lastBlink = millis();
         blinkPhase = !blinkPhase;
         cursorOn = !cursorOn;
         int cw = cellWidth();
         if (blinkTextPresent) {
-            for (int r = 0; r < ROWS; r++) {
+            for (int r = 0; r < textRows(); r++) {
                 for (int c = 0; c < effCols(); c++) {
                     if (cellAttr[r][c] & ATTR_BLINK) {
                         fastDrawChars(c, r, &screen[r][c], &cellAttr[r][c], 1,
@@ -691,5 +808,13 @@ void loop() {
                 fastDrawChars(cx, cy, &screen[cy][cx], &cellAttr[cy][cx], 1, curFg, curBg, 0, false, cw);
             }
         }
+        if (gfxMode == GFX_COMBINED) gfxNeedsReplay = true;
+    }
+
+    // In combined mode graphics sit above text, so repaint them after any
+    // text redraw or cursor blink that may have wiped part of a shape.
+    if (gfxMode == GFX_COMBINED && gfxNeedsReplay) {
+        gfxReplay();
+        gfxNeedsReplay = false;
     }
 }
