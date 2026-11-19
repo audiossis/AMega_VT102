@@ -78,6 +78,44 @@ static void setDoubleWidth(bool on) {
     for (int r = 0; r < ROWS; r++) markDirty(r);
 }
 
+// ---- Tek-style vector graphics mode --------------------------------------
+// A dedicated full-screen graphics mode.  The text buffers stay untouched in
+// RAM, so exiting simply redraws them.  Coordinates are native pixels.
+static bool graphicsMode = false;
+static int beamX = 0, beamY = 0;
+
+static void gfxClamp(int &x, int &y) {
+    if (x < 0) x = 0; else if (x >= TERM_W) x = TERM_W - 1;
+    if (y < 0) y = 0; else if (y >= TERM_H) y = TERM_H - 1;
+}
+static void gfxPoint(int x, int y) { gfxClamp(x, y); tft.drawPixel(x, y, curFg); }
+static void gfxLine(int x1, int y1, int x2, int y2) {
+    gfxClamp(x1, y1); gfxClamp(x2, y2);
+    tft.drawLine(x1, y1, x2, y2, curFg);
+}
+static void gfxRect(int x, int y, int w, int h) {
+    if (w < 1 || h < 1) return;
+    int x2 = x + w - 1, y2 = y + h - 1;
+    gfxClamp(x, y); gfxClamp(x2, y2);
+    tft.drawRect(x, y, x2 - x + 1, y2 - y + 1, curFg);
+}
+static void gfxCircle(int x, int y, int r) {
+    if (r < 0) return;
+    gfxClamp(x, y);
+    tft.drawCircle(x, y, r, curFg);
+}
+static void gfxEnter() {
+    if (graphicsMode) return;
+    graphicsMode = true;
+    beamX = 0; beamY = 0;
+    tft.fillScreen(curBg);
+}
+static void gfxExit() {
+    if (!graphicsMode) return;
+    graphicsMode = false;
+    for (int r = 0; r < ROWS; r++) markDirty(r);
+}
+
 // ILI9481 MADCTL 0x28 has BGR=1, so colour words are BGR565 (R/B swapped).
 static const uint16_t ansiColors[16] = {
     0x0000, 0x001F, 0x07E0, 0x07FF,
@@ -283,6 +321,34 @@ static uint16_t xterm256(int n) {
 static void handleCsi(char final) {
     bool privateMode = (csiBuf[0] == '?');
     parseCsiParams();
+
+    // Graphics-mode primitives.  M/D/P use row;col like cursor addressing;
+    // L/R/C use x;y like graphics coordinates.  Other finals (m, h, l, ...)
+    // fall through to normal handling so SGR colours and mode toggles work.
+    if (graphicsMode) {
+        switch (final) {
+            case 'M': { beamY = csiParam(0, 0); beamX = csiParam(1, 0); return; }
+            case 'D': {
+                int y = csiParam(0, 0), x = csiParam(1, 0);
+                gfxLine(beamX, beamY, x, y); beamX = x; beamY = y; return;
+            }
+            case 'P': { gfxPoint(csiParam(1, 0), csiParam(0, 0)); return; }
+            case 'L': {
+                gfxLine(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0), csiParam(3, 0));
+                return;
+            }
+            case 'R': {
+                gfxRect(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0), csiParam(3, 0));
+                return;
+            }
+            case 'C': {
+                gfxCircle(csiParam(0, 0), csiParam(1, 0), csiParam(2, 0));
+                return;
+            }
+            default: break;
+        }
+    }
+
     switch (final) {
         case 'H': case 'f': {
             int r = csiParam(0, 1) - 1; int c = csiParam(1, 1) - 1;
@@ -297,6 +363,10 @@ static void handleCsi(char final) {
         case 'D': { int n = csiParam(0,1); cx -= n; if (cx < 0) cx = 0; break; }
         case 'J': {
             int mode = csiParam(0, 0);
+            if (graphicsMode) {
+                if (mode == 2 || mode == 3) { tft.fillScreen(curBg); beamX = 0; beamY = 0; }
+                break;
+            }
             if (mode == 2 || mode == 3) {
                 tft.fillScreen(curBg);
                 for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
@@ -419,6 +489,7 @@ static void handleCsi(char final) {
                     if (csiParams[i] == 25) cursorVisible = true;
                     if (csiParams[i] == 50) setDoubleWidth(false); // normal width
                     if (csiParams[i] == 51) setDoubleWidth(true);  // double width
+                    if (csiParams[i] == 60) gfxEnter();              // vector graphics mode
                 }
             }
             break;
@@ -430,6 +501,7 @@ static void handleCsi(char final) {
                     if (csiParams[i] == 7) autoWrap = false;
                     if (csiParams[i] == 25) cursorVisible = false;
                     if (csiParams[i] == 50 || csiParams[i] == 51) setDoubleWidth(false);
+                    if (csiParams[i] == 60) gfxExit();               // back to text mode
                 }
             }
             break;
@@ -449,7 +521,7 @@ static void handleEsc(char ch) {
         cx = 0; cy = 0; curFg = 0xFFFF; curBg = 0x0000; curAttr = 0;
         scrollTop = 0; scrollBottom = ROWS - 1;
         originMode = false; autoWrap = true; cursorVisible = true;
-        decGraphics = false; doubleWidth = false;
+        decGraphics = false; doubleWidth = false; graphicsMode = false;
         for (int r = 0; r < ROWS; r++) markDirty(r);
         pstate = ST_NORMAL;
     }
@@ -558,7 +630,7 @@ void loop() {
 
     // Redraw dirty rows (debounced: only when no data pending and 20ms since last redraw)
     static unsigned long lastRedraw = 0;
-    if (needsRedraw && dirtyMin <= dirtyMax && !Serial3.available() && !Serial.available() && millis() - lastRedraw > 20) {
+    if (!graphicsMode && needsRedraw && dirtyMin <= dirtyMax && !Serial3.available() && !Serial.available() && millis() - lastRedraw > 20) {
         for (int r = dirtyMin; r <= dirtyMax; r++) {
             fastDrawRow(r, screen[r], cellAttr[r], curFg, curBg);
         }
@@ -569,7 +641,7 @@ void loop() {
     }
 
     // cursor + SGR blink (skip during fast data)
-    if ((cursorVisible || blinkTextPresent) && !Serial3.available() && !Serial.available() && millis() - lastBlink > 500) {
+    if (!graphicsMode && (cursorVisible || blinkTextPresent) && !Serial3.available() && !Serial.available() && millis() - lastBlink > 500) {
         lastBlink = millis();
         blinkPhase = !blinkPhase;
         cursorOn = !cursorOn;

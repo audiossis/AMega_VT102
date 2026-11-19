@@ -122,6 +122,30 @@ The most useful codes (type the ASCII character shown):
 `_` (`0x5F`) is blank. `o`/`p` and `r`/`s` are partial horizontal lines at
 different vertical scan positions. DEC graphics works in either width mode.
 
+### Tek-style vector graphics mode
+
+`CSI ? 60 h` enters a full-screen vector graphics mode: the display is cleared,
+the text cursor is suspended, and coordinates are native pixels (x 0–399,
+y 0–319). `CSI ? 60 l` exits and restores the previous text screen. `ESC c`
+(full reset) also exits graphics mode. SGR colours apply to drawn shapes.
+
+| Sequence | Action |
+|----------|--------|
+| `CSI y ; x M` | Move the beam to (x, y) without drawing |
+| `CSI y ; x D` | Draw line from beam to (x, y), then move beam there |
+| `CSI y ; x P` | Draw a single point at (x, y) (beam unchanged) |
+| `CSI x1 ; y1 ; x2 ; y2 L` | Draw a line between two points (beam unchanged) |
+| `CSI x ; y ; w ; h R` | Draw a rectangle outline at (x, y), size w×h |
+| `CSI x ; y ; r C` | Draw a circle outline centred at (x, y), radius r |
+| `CSI 2 J` | Clear the graphics screen (in graphics mode) |
+
+Note the different coordinate orders: `M`/`D`/`P` use **row;column** (matching
+`CSI r ; c H`), while `L`/`R`/`C` use **x;y** (matching graphics convention).
+
+Coordinates are clamped to the display. Drawing uses Adafruit_GFX primitives
+(`drawPixel`, `drawLine`, `drawRect`, `drawCircle`), which are fine for modest
+shapes but not high-speed animation. `CSI 31 m` etc. set the drawing colour.
+
 ### Select Graphic Rendition (SGR) — `CSI ... m`
 
 **Basic colours**
@@ -256,4 +280,12 @@ printf '\033[3;1H\033(0mqqqqqj\033(B' > /dev/ttyUSB1
 # Double-width text, then back to normal (each switch clears the screen)
 printf '\033[?51h\033[2;1HLARGE TEXT' > /dev/ttyUSB1
 printf '\033[?50h\033[5;1HBack to normal width' > /dev/ttyUSB1
+
+# Vector graphics: coloured lines, rectangle, circle, then back to text
+printf '\033[?60h' > /dev/ttyUSB1
+printf '\033[31m\033[0;0M\033[319;399D' > /dev/ttyUSB1       # red diagonal
+printf '\033[32m\033[20;20;100;200R' > /dev/ttyUSB1          # green rectangle
+printf '\033[34m\033[160;200;60C' > /dev/ttyUSB1             # blue circle
+printf '\033[33m\033[10;20;300;380L' > /dev/ttyUSB1          # yellow line
+printf '\033[?60l' > /dev/ttyUSB1
 ```
