@@ -1,4 +1,4 @@
-# Arduino Mega 2560 + 3.5" LCD — VT102 Terminal
+# Arduino Mega VT102 display over serial w/MCUFriend ILI9481 3.5" Colour LCD
 
 A VT102-style terminal on an Arduino Mega 2560 driving an MCUFRIEND 3.5" TFT
 (ILI9481, 480×320). The display uses a 400×320 region with a 66×30 character
