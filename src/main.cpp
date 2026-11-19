@@ -417,6 +417,14 @@ static void handleOsc(char ch) {
     if (ch == '\a' || ch == '\x1B') { pstate = ST_NORMAL; }
 }
 
+// Echo only printable data typed in normal state.  Control bytes and any
+// character consumed as part of an escape sequence (CSI/OSC params and final
+// bytes are printable ASCII) must not be echoed back to the sender.
+static bool shouldEcho(char ch) {
+    uint8_t b = (uint8_t)ch;
+    return pstate == ST_NORMAL && b >= 0x20 && b < 0x7F;
+}
+
 static void processChar(char ch) {
     switch (pstate) {
         case ST_NORMAL:
@@ -480,13 +488,17 @@ void loop() {
     unsigned long batchStart = millis();
     while (Serial3.available() && (millis() - batchStart < 25)) {
         char ch = Serial3.read();
+        bool echo = shouldEcho(ch);  // check before parser state changes
         processChar(ch);
-        Serial.write(ch);
+        if (echo) Serial3.write(ch); // echo printable data back to sender
+        Serial.write(ch);            // mirror everything to debug port
     }
     while (Serial.available()) {
         char ch = Serial.read();
+        bool echo = shouldEcho(ch);
         processChar(ch);
-        Serial3.write(ch);
+        if (echo) Serial.write(ch);  // echo printable data back to debug sender
+        Serial3.write(ch);           // forward everything to terminal port
     }
 
     // Redraw dirty rows (debounced: only when no data pending and 20ms since last redraw)
