@@ -93,6 +93,34 @@ characters — `printf` is recommended.
 | `CSI ? 7 l` | Auto-wrap off — text stays at right margin |
 | `CSI ? 25 h` | Show blinking cursor (default) |
 | `CSI ? 25 l` | Hide cursor |
+| `CSI ? 50 h` | Normal width — 66 columns, 6×8 px cells (clears screen) |
+| `CSI ? 51 h` | Double width — 33 columns, 12×8 px cells (clears screen) |
+
+Switching width clears the screen and homes the cursor (like DECCOLM on a real
+VT). `ESC c` (full reset) also returns to normal width. `CSI ? 50 l` and
+`CSI ? 51 l` are accepted as aliases for normal width.
+
+### DEC Special Graphics (line drawing)
+
+`ESC ( 0` selects the DEC Special Graphics character set: bytes `0x5F`–`0x7E`
+then render as line-drawing glyphs. `ESC ( B` returns to ASCII. The character
+set is recorded per cell, so boxes drawn earlier stay intact after switching
+back to ASCII. `ESC )` (G1 designation) is accepted but ignored.
+
+The most useful codes (type the ASCII character shown):
+
+| Char | Glyph | Char | Glyph | Char | Glyph | Char | Glyph |
+|------|-------|------|-------|------|-------|------|-------|
+| `` ` `` | ◆ | `f` | ° | `j` | ┘ | `q` | ─ |
+| `a` | █ | `g` | ± | `k` | ┐ | `x` | │ |
+| `b` | ␉ | `y` | ≤ | `l` | ┌ | `t` | ├ |
+| `c` | ␌ | `z` | ≥ | `m` | └ | `u` | ┤ |
+| `d` | ␍ | `{` | π | `n` | ┼ | `v` | ┴ |
+| `e` | ␊ | `\|` | ≠ | `o`,`p` | upper line | `w` | ┬ |
+| `i` | ␋ | `}` | £ | `r`,`s` | lower line | `~` | · |
+
+`_` (`0x5F`) is blank. `o`/`p` and `r`/`s` are partial horizontal lines at
+different vertical scan positions. DEC graphics works in either width mode.
 
 ### Select Graphic Rendition (SGR) — `CSI ... m`
 
@@ -214,4 +242,18 @@ printf '\033[2J\033[10;10HSTART\033[2A\033[5CUP-RIGHT\033[2B\033[5CDOWN' > /dev/
 
 # Hide cursor, disable auto-wrap
 printf '\033[?25l\033[?7l' > /dev/ttyUSB1
+
+# DEC graphics: a box (l=┌ q=─ k=┐ x=│ m=└ j=┘)
+printf '\033[2J\033(0lqqqqk\033(B' > /dev/ttyUSB1
+printf '\033[2;1H\033(0x\033(BHELLO\033(0x\033(B' > /dev/ttyUSB1
+printf '\033[3;1H\033(0mqqqqj\033(B' > /dev/ttyUSB1
+
+# DEC graphics + double width (large box)
+printf '\033[?51h\033(0lqqqqqk\033(B' > /dev/ttyUSB1
+printf '\033[2;1H\033(0x\033(BWIDE\033(0x\033(B' > /dev/ttyUSB1
+printf '\033[3;1H\033(0mqqqqqj\033(B' > /dev/ttyUSB1
+
+# Double-width text, then back to normal (each switch clears the screen)
+printf '\033[?51h\033[2;1HLARGE TEXT' > /dev/ttyUSB1
+printf '\033[?50h\033[5;1HBack to normal width' > /dev/ttyUSB1
 ```

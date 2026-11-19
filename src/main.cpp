@@ -2,6 +2,7 @@
 #include <Adafruit_GFX.h>
 #include <MCUFRIEND_kbv.h>
 #include "termfont.h"
+#include "decgraphics.h"
 
 MCUFRIEND_kbv tft;
 
@@ -18,6 +19,7 @@ static char     screen[ROWS][COLS + 1];
 #define ATTR_REVERSE   0x01
 #define ATTR_UNDERLINE 0x02
 #define ATTR_BLINK     0x04
+#define ATTR_DECGRAPH  0x08  // render 0x5F..0x7E with DEC line-drawing font
 static uint8_t cellAttr[ROWS][COLS]; // 30*66 = 1980 bytes
 static uint8_t curAttr = 0;
 static uint16_t rowFg[ROWS], rowBg[ROWS]; // colour snapshot for blink redraws (120 bytes)
@@ -52,6 +54,30 @@ static void markDirty(int r) {
 static uint16_t curFg = 0xFFFF;
 static uint16_t curBg = 0x0000;
 
+// DEC graphics (ESC ( 0 / ESC ( B) is baked into each cell at write time so
+// previously drawn boxes stay boxes when the charset is switched back.
+static bool decGraphics = false;
+
+// Double-width mode (CSI ?51h / CSI ?50h).  Like DECCOLM, switching clears the
+// screen: 66 normal cells (6 px each) or 33 wide cells (12 px each).
+static bool doubleWidth = false;
+static int effCols() { return doubleWidth ? TERM_W / (CHAR_W * 2) : COLS; }
+static int cellWidth() { return doubleWidth ? CHAR_W * 2 : CHAR_W; }
+
+static void setDoubleWidth(bool on) {
+    if (doubleWidth == on) return;
+    doubleWidth = on;
+    tft.fillScreen(curBg);
+    for (int r = 0; r < ROWS; r++) {
+        for (int c = 0; c < COLS; c++) screen[r][c] = ' ';
+        screen[r][COLS] = '\0';
+        clearAttrRow(r);
+    }
+    blinkTextPresent = false;
+    cx = 0; cy = 0; justCR = false;
+    for (int r = 0; r < ROWS; r++) markDirty(r);
+}
+
 // ILI9481 MADCTL 0x28 has BGR=1, so colour words are BGR565 (R/B swapped).
 static const uint16_t ansiColors[16] = {
     0x0000, 0x001F, 0x07E0, 0x07FF,
@@ -71,12 +97,14 @@ static uint16_t pixbuf[PIXBUF_CHARS * CHAR_W * CHAR_H + CHAR_W * CHAR_H]; // 768
 
 static void fastDrawChars(int col, int row, const char *str, const uint8_t *attr,
                           int n, uint16_t fg, uint16_t bg, int extraBg = 0,
-                          bool blinkPhase = false) {
+                          bool blinkPhase = false, int cellW = CHAR_W) {
     if (n <= 0) return;
-    if (n > PIXBUF_CHARS) n = PIXBUF_CHARS;
-    int x = col * CHAR_W;
+    int scale = cellW / CHAR_W;             // 1 = normal, 2 = double width
+    int maxChars = PIXBUF_CHARS / scale;    // keep the pixel buffer bounded
+    if (n > maxChars) n = maxChars;
+    int x = col * cellW;
     int y = row * CHAR_H;
-    int w = n * CHAR_W + extraBg;
+    int w = n * cellW + extraBg;
     tft.setAddrWindow(x, y, x + w - 1, y + CHAR_H - 1);
     uint16_t *p = pixbuf;
     // ILI9481 rotation 1 streams GRAM bottom-to-top on the vertical axis,
@@ -91,31 +119,41 @@ static void fastDrawChars(int col, int row, const char *str, const uint8_t *attr
             if (a & ATTR_REVERSE) { cellFg = bg; cellBg = fg; }
             if ((a & ATTR_BLINK) && blinkPhase) { cellFg = cellBg; }
             bool underline = (a & ATTR_UNDERLINE) && (py == 0); // font bit 0x80 = glyph bottom row
-            for (int i = 0; i < CHAR_W; i++) { // 5 font columns + 1 gap
-                uint8_t line = 0;
-                if (i < 5) line = pgm_read_byte(&term_font[c * 5 + i]);
+            const unsigned char *font = term_font;
+            int base = c * 5;
+            if ((a & ATTR_DECGRAPH) && c >= 0x5F && c <= 0x7E) {
+                font = dec_font;
+                base = (c - 0x5F) * 5;
+            }
+            for (int i = 0; i < cellW; i++) { // 5 font columns (scaled) + gap
+                int fc = i / scale;           // font column 0..4; >=5 is the gap
+                uint8_t line = (fc < 5) ? pgm_read_byte(&font[base + fc]) : 0;
                 *p++ = (underline || (line & bit)) ? cellFg : cellBg;
             }
         }
         for (int k = 0; k < extraBg; k++) *p++ = bg;
     }
-    tft.pushColors(pixbuf, (n * CHAR_W + extraBg) * CHAR_H, true);
+    tft.pushColors(pixbuf, (n * cellW + extraBg) * CHAR_H, true);
 }
 
 static void fastDrawRow(int row, const char *str, const uint8_t *attr,
                         uint16_t fg, uint16_t bg, bool blinkPhase = false) {
-    const int remainder = TERM_W - COLS * CHAR_W; // right edge not covered by whole cells
-    for (int c = 0; c < COLS; c += PIXBUF_CHARS) {
-        int n = COLS - c;
-        if (n > PIXBUF_CHARS) n = PIXBUF_CHARS;
-        int extra = (c + n == COLS) ? remainder : 0;
+    int cols = effCols();
+    int cw = cellWidth();
+    int chunk = PIXBUF_CHARS / (cw / CHAR_W);   // 16 normal, 8 double-width
+    const int remainder = TERM_W - cols * cw;   // right edge padding (4 px either way)
+    for (int c = 0; c < cols; c += chunk) {
+        int n = cols - c;
+        if (n > chunk) n = chunk;
+        int extra = (c + n == cols) ? remainder : 0;
         fastDrawChars(c, row, str + c, attr ? attr + c : nullptr,
-                      n, fg, bg, extra, blinkPhase);
+                      n, fg, bg, extra, blinkPhase, cw);
     }
 }
 
-enum ParseState { ST_NORMAL, ST_ESC, ST_CSI, ST_OSC };
+enum ParseState { ST_NORMAL, ST_ESC, ST_CSI, ST_OSC, ST_CHARSET };
 static ParseState pstate = ST_NORMAL;
+static bool charsetG1 = false;   // ESC ( = G0, ESC ) = G1 (G1 designations ignored)
 static char csiBuf[32];
 static uint8_t csiLen = 0;
 
@@ -177,7 +215,8 @@ static void newline() {
 }
 
 static void putChar(char ch) {
-    if (cx >= COLS) {
+    int cols = effCols();
+    if (cx >= cols) {
         if (autoWrap) {
             markDirty(cy);
             cx = 0; cy++;
@@ -194,11 +233,11 @@ static void putChar(char ch) {
             if (cy >= ROWS) cy = ROWS - 1;
             markDirty(cy);
         } else {
-            cx = COLS - 1;
+            cx = cols - 1;
         }
     }
     screen[cy][cx] = ch;
-    cellAttr[cy][cx] = curAttr;
+    cellAttr[cy][cx] = curAttr | (decGraphics ? ATTR_DECGRAPH : 0);
     rowFg[cy] = curFg; rowBg[cy] = curBg;
     if (curAttr & ATTR_BLINK) blinkTextPresent = true;
     markDirty(cy);
@@ -210,7 +249,7 @@ static void handleControl(char ch) {
         case '\r': cx = 0; newline(); justCR = true; break;
         case '\n': if (!justCR) newline(); justCR = false; cx = 0; break;
         case '\b': if (cx > 0) { cx--; screen[cy][cx] = ' '; cellAttr[cy][cx] = 0; markDirty(cy); } break;
-        case '\t': cx = (cx + 8) & ~7; if (cx >= COLS) cx = COLS - 1; break;
+        case '\t': cx = (cx + 8) & ~7; if (cx >= effCols()) cx = effCols() - 1; break;
         case '\a': break;
         case '\x1B': pstate = ST_ESC; break;
         case '\x0C':
@@ -249,12 +288,12 @@ static void handleCsi(char final) {
             int r = csiParam(0, 1) - 1; int c = csiParam(1, 1) - 1;
             if (originMode) { r += scrollTop; if (r > scrollBottom) r = scrollBottom; }
             if (r < 0) r = 0; if (r >= ROWS) r = ROWS - 1;
-            if (c < 0) c = 0; if (c >= COLS) c = COLS - 1;
+            if (c < 0) c = 0; if (c >= effCols()) c = effCols() - 1;
             cx = c; cy = r; markDirty(cy); break;
         }
         case 'A': { int n = csiParam(0,1); cy -= n; if (cy < scrollTop) cy = scrollTop; markDirty(cy); break; }
         case 'B': { int n = csiParam(0,1); cy += n; if (cy > scrollBottom) cy = scrollBottom; markDirty(cy); break; }
-        case 'C': { int n = csiParam(0,1); cx += n; if (cx >= COLS) cx = COLS-1; break; }
+        case 'C': { int n = csiParam(0,1); cx += n; if (cx >= effCols()) cx = effCols()-1; break; }
         case 'D': { int n = csiParam(0,1); cx -= n; if (cx < 0) cx = 0; break; }
         case 'J': {
             int mode = csiParam(0, 0);
@@ -305,19 +344,21 @@ static void handleCsi(char final) {
             cx = 0; break;
         }
         case '@': {
+            int cols = effCols();
             int n = csiParam(0, 1);
-            if (n > COLS - cx) n = COLS - cx;
-            for (int c = COLS-1; c >= cx+n; c--) { screen[cy][c] = screen[cy][c-n]; cellAttr[cy][c] = cellAttr[cy][c-n]; }
+            if (n > cols - cx) n = cols - cx;
+            for (int c = cols-1; c >= cx+n; c--) { screen[cy][c] = screen[cy][c-n]; cellAttr[cy][c] = cellAttr[cy][c-n]; }
             for (int c = cx; c < cx+n; c++) { screen[cy][c] = ' '; cellAttr[cy][c] = 0; }
             screen[cy][COLS] = '\0';
             markDirty(cy);
             break;
         }
         case 'P': {
+            int cols = effCols();
             int n = csiParam(0, 1);
-            if (n > COLS - cx) n = COLS - cx;
-            for (int c = cx; c < COLS-n; c++) { screen[cy][c] = screen[cy][c+n]; cellAttr[cy][c] = cellAttr[cy][c+n]; }
-            for (int c = COLS-n; c < COLS; c++) { screen[cy][c] = ' '; cellAttr[cy][c] = 0; }
+            if (n > cols - cx) n = cols - cx;
+            for (int c = cx; c < cols-n; c++) { screen[cy][c] = screen[cy][c+n]; cellAttr[cy][c] = cellAttr[cy][c+n]; }
+            for (int c = cols-n; c < cols; c++) { screen[cy][c] = ' '; cellAttr[cy][c] = 0; }
             screen[cy][COLS] = '\0';
             markDirty(cy);
             break;
@@ -376,6 +417,8 @@ static void handleCsi(char final) {
                     if (csiParams[i] == 6) originMode = true;
                     if (csiParams[i] == 7) autoWrap = true;
                     if (csiParams[i] == 25) cursorVisible = true;
+                    if (csiParams[i] == 50) setDoubleWidth(false); // normal width
+                    if (csiParams[i] == 51) setDoubleWidth(true);  // double width
                 }
             }
             break;
@@ -386,6 +429,7 @@ static void handleCsi(char final) {
                     if (csiParams[i] == 6) originMode = false;
                     if (csiParams[i] == 7) autoWrap = false;
                     if (csiParams[i] == 25) cursorVisible = false;
+                    if (csiParams[i] == 50 || csiParams[i] == 51) setDoubleWidth(false);
                 }
             }
             break;
@@ -397,6 +441,7 @@ static void handleCsi(char final) {
 static void handleEsc(char ch) {
     if (ch == '[') { pstate = ST_CSI; csiLen = 0; csiBuf[0] = '\0'; }
     else if (ch == ']') { pstate = ST_OSC; csiLen = 0; }
+    else if (ch == '(' || ch == ')') { charsetG1 = (ch == ')'); pstate = ST_CHARSET; }
     else if (ch == 'c') {
         tft.fillScreen(0x0000);
         for (int r = 0; r < ROWS; r++) { for (int c = 0; c < COLS; c++) screen[r][c] = ' '; screen[r][COLS] = '\0'; clearAttrRow(r); }
@@ -404,6 +449,7 @@ static void handleEsc(char ch) {
         cx = 0; cy = 0; curFg = 0xFFFF; curBg = 0x0000; curAttr = 0;
         scrollTop = 0; scrollBottom = ROWS - 1;
         originMode = false; autoWrap = true; cursorVisible = true;
+        decGraphics = false; doubleWidth = false;
         for (int r = 0; r < ROWS; r++) markDirty(r);
         pstate = ST_NORMAL;
     }
@@ -447,6 +493,15 @@ static void processChar(char ch) {
             break;
         case ST_OSC:
             handleOsc(ch);
+            break;
+        case ST_CHARSET:
+            // ESC ( 0 = DEC Special Graphics, ESC ( B = ASCII.  G1 (ESC ))
+            // designations are accepted but unused, so just consume them.
+            if (!charsetG1) {
+                if (ch == '0') decGraphics = true;
+                else if (ch == 'B') decGraphics = false;
+            }
+            pstate = ST_NORMAL;
             break;
     }
 }
@@ -518,21 +573,22 @@ void loop() {
         lastBlink = millis();
         blinkPhase = !blinkPhase;
         cursorOn = !cursorOn;
+        int cw = cellWidth();
         if (blinkTextPresent) {
             for (int r = 0; r < ROWS; r++) {
-                for (int c = 0; c < COLS; c++) {
+                for (int c = 0; c < effCols(); c++) {
                     if (cellAttr[r][c] & ATTR_BLINK) {
                         fastDrawChars(c, r, &screen[r][c], &cellAttr[r][c], 1,
-                                      rowFg[r], rowBg[r], 0, blinkPhase);
+                                      rowFg[r], rowBg[r], 0, blinkPhase, cw);
                     }
                 }
             }
         }
         if (cursorVisible) {
             if (cursorOn) {
-                fastDrawChars(cx, cy, " ", nullptr, 1, 0x0000, curFg);
+                fastDrawChars(cx, cy, " ", nullptr, 1, 0x0000, curFg, 0, false, cw);
             } else {
-                fastDrawChars(cx, cy, &screen[cy][cx], &cellAttr[cy][cx], 1, curFg, curBg);
+                fastDrawChars(cx, cy, &screen[cy][cx], &cellAttr[cy][cx], 1, curFg, curBg, 0, false, cw);
             }
         }
     }
